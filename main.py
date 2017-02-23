@@ -5,8 +5,10 @@ import cv2
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
 
+from cython_bbox import bbox_overlaps
+
 NUM_CLASSES = 20
-BATCH_SIZE = 50
+BATCH_SIZE = 128
 
 FEAT_STRIDE = [16, ]
 BASE_SIZE = 16
@@ -15,6 +17,12 @@ ANCHOR_SCALES = np.array([8, 16, 32])
 RPN_NMS_THRESH = 0.7
 RPN_PRE_NMS_TOP_N = 12000
 RPN_POST_NMS_TOP_N = 2000
+
+RPN_POSITIVE_OVERLAP = 0.7
+RPN_NEGATIVE_OVERLAP = 0.3
+
+RPN_BATCH_SIZE = 256
+RPN_FG_FRACTION = 0.5
 
 
 def vgg16_conv(inputs):
@@ -225,9 +233,62 @@ def proposal_layer(rpn_cls_prob, rpn_bbox_pred, im_info, feat_stride, anchors, s
     return blob, scores
 
 
+def anchor_target_layer(rpn_cls_prob, ground_truth, im_info, feat_stride, original_anchors, scales):
+    A = scales.shape[0] * 3
+    K = original_anchors.shape[0] / A
+
+    rpn_positive_overlap = RPN_POSITIVE_OVERLAP
+    rpn_negative_overlap = RPN_NEGATIVE_OVERLAP
+
+    rpn_fg_fraction = RPN_FG_FRACTION
+
+    allowed_border_width = 0
+
+    height, width = rpn_cls_prob.shape[1:3]
+
+    indices_within_border = np.where(
+        (original_anchors[:, 0] >= -allowed_border_width) and
+        (original_anchors[:, 1] >= -allowed_border_width) and
+        (original_anchors[:, 2] < im_info[0][1] + allowed_border_width) and
+        (original_anchors[:, 3] < im_info[0][0] + allowed_border_width)
+    )[0]
+
+    anchors = original_anchors[indices_within_border, :]
+
+    labels = np.empty((len(indices_within_border), ), dtype=np.float32)
+    labels.fill(-1)  # 1 for positive, 0 for negative, -1 for ambiguous samples
+
+    overlaps = bbox_overlaps(
+        np.ascontiguousarray(anchors, dtype=np.float),
+        np.ascontiguousarray(ground_truth, dtype=np.float)
+    )  # A N*K matrix of IoU
+
+    overlaps_max = overlaps[np.arange(len(indices_within_border)), overlaps.argmax(axis=1)]
+    overlaps_groundtruth_max = overlaps[overlaps.argmax(axis=0), np.arange(overlaps.shape[1])]
+    overlaps_groundtruth_max = np.where(overlaps == overlaps_groundtruth_max)[0]
+
+    labels[overlaps_max < rpn_negative_overlap] = 0
+    labels[overlaps_groundtruth_max] = 1
+    labels[overlaps_max >= rpn_positive_overlap] = 1
+
+    # Reduce the number if necessary
+    cnt_foreground = int(rpn_fg_fraction * RPN_BATCH_SIZE)
+    foreground_indices = np.where(labels == 0)[0]
+    if len(foreground_indices) > cnt_foreground:
+        disabled_indices = np.random.choice(foreground_indices, size=len(foreground_indices) - cnt_foreground, replace=False)
+        labels[disabled_indices] = -1
+
+    cnt_background = RPN_BATCH_SIZE - np.sum(labels == 1)
+    background_indices = np.where(labels == 0)[0]
+    if len(background_indices) > cnt_background:
+        disabled_indices = np.random.choice(background_indices, size=len(background_indices) - cnt_background, replace=False)
+        labels[disabled_indices] = -1
+
+
 def main():
     image = tf.placeholder(tf.float32, shape=[BATCH_SIZE, None, None, 3])
     im_info = tf.placeholder(tf.float32, shape=[BATCH_SIZE, 3])
+    ground_truth = tf.placeholder(tf.float32, shape=[None, 5])
 
     inputs_layer = tf.placeholder(tf.float32, shape=[BATCH_SIZE, None, None, 3])
 
@@ -244,9 +305,17 @@ def main():
     roi, roi_score = tf.py_func(proposal_layer,
                                 [rpn_cls_prob, rpn_bbox_pred, im_info, FEAT_STRIDE, anchors, ANCHOR_SCALES],
                                 [tf.float32, tf.float32],
-                                name='generate_roi')
+                                name='proposal')
     roi.set_shape([None, 5])
     roi_score.set_shape([None, 1])
+
+    rpn_labels, \
+    rpn_bbox_target, \
+    rpn_bbox_inside_weights, \
+    rpn_bbox_outside_weights = tf.py_func(anchor_target_layer,
+                                          [rpn_cls_prob, ground_truth, im_info, FEAT_STRIDE, anchors, ANCHOR_SCALES],
+                                          [tf.float32, tf.float32, tf.float32, tf.float32],
+                                          name='anchor_target')
 
 
 if __name__ == '__main__':
