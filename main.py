@@ -233,6 +233,38 @@ def proposal_layer(rpn_cls_prob, rpn_bbox_pred, im_info, feat_stride, anchors, s
     return blob, scores
 
 
+def bbox_transform(bbox, groundtruth):
+    bbox_widths = bbox[:, 2] - bbox[:, 0] + 1.0
+    bbox_heights = bbox[:, 3] - bbox[:, 1] + 1.0
+    bbox_center_x = bbox[:, 0] + bbox_widths / 2
+    bbox_center_y = bbox[:, 1] + bbox_heights / 2
+
+    groundtruth_widths = groundtruth[:, 2] - groundtruth[:, 0] + 1.0
+    groundtruth_heights = groundtruth[:, 3] - groundtruth[:, 1] + 1.0
+    groundtruth_center_x = groundtruth[:, 0] + groundtruth_widths / 2
+    groundtruth_center_y = groundtruth[:, 1] + groundtruth_heights / 2
+
+    dx = (groundtruth_center_x - bbox_center_x) / bbox_widths
+    dy = (groundtruth_center_y - bbox_center_y) / bbox_heights
+    dw = np.log(groundtruth_widths / bbox_widths)
+    dh = np.log(groundtruth_heights / bbox_heights)
+
+    return np.vstack((dx, dy, dw, dh)).transpose()
+
+
+def mapping_back(data, origin_cnt, indices, fill_data=0):
+    if len(data.shape) == 1:
+        res = np.empty((origin_cnt, ), dtype=np.float32)
+        res.fill(fill_data)
+        res[indices] = data
+    else:
+        res = np.empty((origin_cnt, ) + data.shape[1:], dtype=np.float32)
+        res.fill(fill_data)
+        res[indices, :] = data
+
+    return res
+
+
 def anchor_target_layer(rpn_cls_prob, ground_truth, im_info, feat_stride, original_anchors, scales):
     A = scales.shape[0] * 3
     K = original_anchors.shape[0] / A
@@ -284,6 +316,31 @@ def anchor_target_layer(rpn_cls_prob, ground_truth, im_info, feat_stride, origin
         disabled_indices = np.random.choice(background_indices, size=len(background_indices) - cnt_background, replace=False)
         labels[disabled_indices] = -1
 
+    # Calculate the transformation parameters dx, dy, dw, dh
+    # bbox_targets = np.zeros((len(indices_within_border), 4), dtype=np.float32)
+    bbox_targets = bbox_transform(anchors, ground_truth[overlaps_max, :4]).astype(np.float32, copy=False)
+
+    bbox_within_border_weights = np.zeros((len(indices_within_border), 4), dtype=np.float32)
+    bbox_within_border_weights[labels == 1, :] = np.array([1.0, 1.0, 1.0, 1.0])
+
+    bbox_outside_border_weights = np.zeros((len(indices_within_border), 4), dtype=np.float32)
+    cnt_examples = np.sum(labels >= 0)
+    positive_weights = np.ones((1, 4)) * 1.0 / cnt_examples
+    negative_weights = np.ones((1, 4)) * 1.0 / cnt_examples
+    bbox_outside_border_weights[labels == 1, :] = positive_weights
+    bbox_outside_border_weights[labels == 0, :] = negative_weights
+
+    labels = mapping_back(labels, original_anchors.shape[0], indices_within_border, -1)
+    bbox_targets = mapping_back(bbox_targets, original_anchors.shape[0], indices_within_border, 0)
+    bbox_within_border_weights = mapping_back(bbox_within_border_weights, original_anchors.shape[0], indices_within_border, 0)
+    bbox_outside_border_weights = mapping_back(bbox_outside_border_weights, original_anchors.shape[0], indices_within_border, 0)
+
+    labels = labels.reshape((1, height, width, A)).transpose(0, 3, 1, 2).reshape((1, 1, A * height, width))
+    bbox_within_border_weights = bbox_within_border_weights.reshape((1, height, width, A * 4))
+    bbox_outside_border_weights = bbox_outside_border_weights.reshape((1, height, width, A * 4))
+
+    return labels, bbox_targets, bbox_within_border_weights, bbox_outside_border_weights
+
 
 def main():
     image = tf.placeholder(tf.float32, shape=[BATCH_SIZE, None, None, 3])
@@ -311,11 +368,18 @@ def main():
 
     rpn_labels, \
     rpn_bbox_target, \
-    rpn_bbox_inside_weights, \
+    rpn_bbox_within_weights, \
     rpn_bbox_outside_weights = tf.py_func(anchor_target_layer,
                                           [rpn_cls_prob, ground_truth, im_info, FEAT_STRIDE, anchors, ANCHOR_SCALES],
                                           [tf.float32, tf.float32, tf.float32, tf.float32],
                                           name='anchor_target')
+
+    rpn_labels.set_shape([1, 1, None, None])
+    rpn_bbox_target.set_shape([1, None, None, 36])
+    rpn_bbox_within_weights.set_shape([1, None, None, 36])
+    rpn_bbox_outside_weights.set_shape([1, None, None, 36])
+
+    rpn_labels = tf.to_int32(rpn_labels)
 
 
 if __name__ == '__main__':
